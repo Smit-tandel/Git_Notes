@@ -1,0 +1,65 @@
+Git and GitHub
+Version Control 
+
+Git Commands
+Clone 
+add
+commit
+push
+pull 
+
+
+Readme.md 
+
+git --version
+
+==>Get-ChildItem -Force (to see hidden items in the directory using command prompt)
+
+==> git status
+for seeing what was added or modidifed in the folder 
+
+==>git add . (means to add all the files edited and created)
+or you can give all the files 
+ex : git add index.html 
+
+==>git commit -m "1.Added index.html" -m "2.some description"
+1.for the message 
+2. description 
+
+==> git push 
+
+==>ssh-keygen -t rsa -b 4096 -C "smittandel2401@gmail.com"
+Generates an SSH key pair for secure authentication.
+
+Breakdown:
+ssh-keygen → Command to generate an SSH key
+-t rsa → Uses the RSA algorithm
+-b 4096 → Creates a 4096-bit key (stronger encryption)
+-C "smittandel2401@gmail.com" → Adds a comment
+
+
+==>dir /b | findstr "testkey"
+to find the keys 
+output 2 keys 
+testkey (Have it as a secret)
+testkey.pub
+
+==>type filename.txt
+(it is used to print the content of the file)
+
+==>clip < testkey.pub
+
+#After Creating the SSh key to connect it with the ssh agent 
+==>(In Windows Powershell as Admin)
+==># Ensure the ssh-agent service starts manually
+Get-Service -Name ssh-agent | Set-Service -StartupType Manual
+
+# Start the ssh-agent
+Start-Service ssh-agent(Replace YOU with your actual Windows username.)
+==>ssh-add C:/Users/YOU/.ssh/testkey
+==>notepad C:/Users/YOU/.ssh/testkey.pub
+==>ssh -T git@github.com(Test the SSh COnnection)
+
+
+# if you donot have a git repository then 
+==> git init 
