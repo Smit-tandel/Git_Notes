@@ -63,3 +63,16 @@ Start-Service ssh-agent(Replace YOU with your actual Windows username.)
 
 # if you donot have a git repository then 
 ==> git init 
+
+==> using it instead of git add origin 
+git remote add origin "link of the repo"
+if the repository is not pulled from the github
+
+==> git remote -v (check the repo)
+
+==>git push -u origin master(-u is used if in future me donot need to write origin master)
+
+==>git branch (to check the branches in the code)
+
+==>git checkout -b feature-notes-branch
+(it is used to create and switch between branches)
