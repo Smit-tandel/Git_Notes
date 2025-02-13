@@ -76,3 +76,21 @@ if the repository is not pulled from the github
 
 ==>git checkout -b feature-notes-branch
 (it is used to create and switch between branches)
+
+==>git branch -d feature-notes-branch
+(it is used to delete a branch )
+
+==>git commit -am "message"(You add and commit at the same time but can only be done for the file which was in the midified condition and not for the newly created file)
+
+==>git reset (unstage a file)
+
+==>git reset HEAD~1(undo the recent commit that is first)
+
+==>git log (to see the series of commit we have done )
+it will have a uid/ address if we have to go back to that certain commit then we have to us e
+
+==> git reset "UID"(then it unstages all the changes done on the commit)
+git reset --hard "UID" (will comeletely reset to  that commit not unstage it)
+
+[Forking]
+
