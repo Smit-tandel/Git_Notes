@@ -1,242 +1,32 @@
-Yes — and I’m glad you asked this, because **this is exactly how you level up from “working code” → “solid system design.”**
+pproach 1: TF-IDF + Cosine Similarity (BEST for you)
+Step 1: Treat your PDFs as “your class”
+Your PDFs → Class = MINE
+Other PDFs → Class = NOT MINE
+Step 2: Build a single “MY DOCUMENT PROFILE”
 
-👉 Short answer: **YES, you should explore better scoring systems**
-👉 Long answer: depends on *how much complexity vs accuracy* you want
+Merge all your PDFs:
 
----
-
-# 🧠 Your Current System (baseline)
-
-Right now you have:
-
-```text
-Sum of keyword weights → threshold
-```
-
-👉 This is:
-
-* Simple ✅
-* Explainable ✅
-* But a bit **naive** ❌
-
----
-
-# 🚀 Better Scoring Systems (ranked from practical → advanced)
-
-I’ll walk you like a senior dev would — **don’t jump to the last one immediately**.
-
----
-
-# 🥇 1. Normalized Score (VERY HIGH ROI)
-
-### Problem in your system:
-
-Long PDFs → more words → higher score (biased)
-
----
-
-### Fix:
-
-```python
-score = matched_weight / total_words
-```
-
-or better:
-
-```python
-score = matched_weight / (total_words + 1)
-```
-
----
-
-### Why this is powerful:
-
-* Removes length bias
-* Makes scores comparable across PDFs
-
-👉 This alone can improve accuracy a lot
-
----
-
-# 🥈 2. Coverage-Based Scoring (VERY IMPORTANT)
-
-Instead of just “how many matches” → also check:
-
-> “How many UNIQUE keywords matched?”
-
----
-
-### Idea:
-
-```python
-coverage = matched_keywords / total_keywords
-```
-
----
-
-### Example:
-
-| Case | Matches                      | Coverage |
-| ---- | ---------------------------- | -------- |
-| A    | 10 hits (same word repeated) | ❌ low    |
-| B    | 5 different keywords         | ✅ high   |
-
----
-
-### Combine with score:
-
-```python
-final_score = 0.7 * weight_score + 0.3 * coverage
-```
-
-👉 This is **MUCH smarter than raw counting**
-
----
-
-# 🥉 3. TF-Based Scoring (light version of TF-IDF)
-
-Instead of just checking presence:
-
-```python
-score += weight * log(1 + frequency)
-```
-
----
-
-### Why?
-
-* Prevents one word repeating 100 times from dominating
-
----
-
-# 🏆 4. Cosine Similarity (BIG upgrade, still simple)
-
-This is where things get **serious but still manageable**
-
----
-
-### Idea:
-
-Represent:
-
-* Your known PDFs → as a vector
-* New PDF → as a vector
-
-Then compute similarity.
-
----
-
-### Concept:
-
-```text
-Your PDFs → "average keyword vector"
-New PDF → "its keyword vector"
-
-Similarity → cosine(angle)
-```
-
----
-
-### Why this is powerful:
-
-* Captures distribution, not just counts
-* Much more stable than threshold rules
-
----
-
-### Tools:
-
-Use:
-
-```python
+my_docs = [pdf1, pdf2, pdf3, ...]
+my_corpus = " ".join(my_docs)
+Step 3: Vectorize
 from sklearn.feature_extraction.text import TfidfVectorizer
+
+vectorizer = TfidfVectorizer(ngram_range=(1,2))
+vectorizer.fit(my_docs + [new_doc])
+Step 4: Compare similarity
 from sklearn.metrics.pairwise import cosine_similarity
-```
 
----
+my_vec = vectorizer.transform([my_corpus])
+new_vec = vectorizer.transform([new_doc])
 
-# 🧠 5. Hybrid System (THIS is what I’d build in your case)
-
-Don’t choose one — combine:
-
-```text
-Final Score =
-    0.5 * weighted_score +
-    0.3 * coverage +
-    0.2 * normalized_score
-```
-
-👉 Then threshold on this
-
----
-
-# ⚖️ Comparison (important for your thinking)
-
-| Method            | Complexity | Accuracy  | When to use  |
-| ----------------- | ---------- | --------- | ------------ |
-| Raw weights       | Low        | Low       | MVP          |
-| Normalized        | Low        | Medium    | Must-have    |
-| Coverage          | Low        | High      | Must-have    |
-| TF scaling        | Medium     | High      | Good upgrade |
-| Cosine similarity | Medium     | Very High | Best non-ML  |
-
----
-
-# 🔥 My Recommendation (as your senior dev)
-
-👉 Don’t over-engineer yet
-
-### Do THIS:
-
-1. Keep your weighted scoring
-2. Add:
-
-   * ✅ normalization
-   * ✅ coverage
-
----
-
-### Final formula:
-
-```python
-final_score = (
-    0.6 * (matched_weight / total_words) +
-    0.4 * (unique_matched / total_keywords)
-)
-```
-
----
-
-# 🚀 Future Path (very important)
-
-You are 1 step away from:
-
-```text
-Rule-based → TF-IDF → Logistic Regression
-```
-
-👉 Your current system is basically:
-
-> “Manual ML without training”
-
----
-
-# 🔥 Now I’ll push your thinking again
-
-Tell me:
-
-👉 What should happen if:
-
-* A PDF matches **only 2 VERY strong bigrams**
-* But nothing else
-
-Should it be:
-
-* ✅ Classified as TRUE
-* ❌ Rejected
-
-Your answer will define:
-
-* whether you prioritize **precision** or **recall**
-
-And that’s a **real-world product decision**, not just code.
+score = cosine_similarity(new_vec, my_vec)[0][0]
+Step 5: Decision
+if score > 0.3:   # tune this threshold
+    return "MINE"
+else:
+    return "NOT MINE"
+🔥 Why this works better than keywords
+Captures overall writing style
+Uses all words automatically
+Handles bigrams naturally
+No manual weighting needed
