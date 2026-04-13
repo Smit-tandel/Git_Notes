@@ -1,32 +1,190 @@
-pproach 1: TF-IDF + Cosine Similarity (BEST for you)
-Step 1: Treat your PDFs as “your class”
-Your PDFs → Class = MINE
-Other PDFs → Class = NOT MINE
-Step 2: Build a single “MY DOCUMENT PROFILE”
+import os
+import re
+import math
+import pdfplumber
+from collections import defaultdict
+from itertools import combinations
 
-Merge all your PDFs:
+# -----------------------------
+# CONFIG
+# -----------------------------
 
-my_docs = [pdf1, pdf2, pdf3, ...]
-my_corpus = " ".join(my_docs)
-Step 3: Vectorize
-from sklearn.feature_extraction.text import TfidfVectorizer
+HIGH_WEIGHT = 3
+MED_WEIGHT = 2
+LOW_WEIGHT = 1
 
-vectorizer = TfidfVectorizer(ngram_range=(1,2))
-vectorizer.fit(my_docs + [new_doc])
-Step 4: Compare similarity
-from sklearn.metrics.pairwise import cosine_similarity
+PROXIMITY_WINDOW = 20  # max word distance
+PROXIMITY_BOOST = 2
+CLASS_BONUS = 2
+EXCLUSIVE_BOOST = 3
 
-my_vec = vectorizer.transform([my_corpus])
-new_vec = vectorizer.transform([new_doc])
+THRESHOLD = 0.15  # normalized threshold
 
-score = cosine_similarity(new_vec, my_vec)[0][0]
-Step 5: Decision
-if score > 0.3:   # tune this threshold
-    return "MINE"
-else:
-    return "NOT MINE"
-🔥 Why this works better than keywords
-Captures overall writing style
-Uses all words automatically
-Handles bigrams naturally
-No manual weighting needed
+
+# -----------------------------
+# KEYWORDS (example)
+# -----------------------------
+
+CLASSES = {
+    "FINANCIAL": {
+        "high": {"pan", "aadhaar", "bank account"},
+        "medium": {"transaction", "balance", "salary"},
+        "low": {"amount", "credit", "debit"},
+        "exclusive": {"ifsc"}
+    },
+    "PERSONAL": {
+        "high": {"passport"},
+        "medium": {"email", "phone number"},
+        "low": {"address", "name"},
+        "exclusive": {"ssn"}
+    }
+}
+
+
+# -----------------------------
+# PDF TEXT EXTRACTION
+# -----------------------------
+
+def extract_text(pdf_path):
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
+    return text
+
+
+# -----------------------------
+# PREPROCESSING
+# -----------------------------
+
+def preprocess(text):
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+# -----------------------------
+# REGEX MATCHING
+# -----------------------------
+
+def regex_match(text, keywords):
+    matches = []
+    for kw in keywords:
+        pattern = r"\b" + re.escape(kw) + r"\b"
+        if re.search(pattern, text):
+            matches.append(kw)
+    return matches
+
+
+# -----------------------------
+# PROXIMITY BOOST
+# -----------------------------
+
+def proximity_score(text, keywords):
+    words = text.split()
+    positions = defaultdict(list)
+
+    for idx, word in enumerate(words):
+        if word in keywords:
+            positions[word].append(idx)
+
+    score = 0
+
+    for w1, w2 in combinations(positions.keys(), 2):
+        for p1 in positions[w1]:
+            for p2 in positions[w2]:
+                if abs(p1 - p2) <= PROXIMITY_WINDOW:
+                    score += PROXIMITY_BOOST
+
+    return score
+
+
+# -----------------------------
+# SCORING FUNCTION
+# -----------------------------
+
+def score_document(text):
+    results = {}
+
+    word_count = len(text.split())
+    if word_count == 0:
+        return {"GENERIC_DOC": 1.0}
+
+    for cls, data in CLASSES.items():
+        score = 0
+
+        high_matches = regex_match(text, data["high"])
+        med_matches = regex_match(text, data["medium"])
+        low_matches = regex_match(text, data["low"])
+        exclusive_matches = regex_match(text, data["exclusive"])
+
+        # Base score
+        score += len(high_matches) * HIGH_WEIGHT
+        score += len(med_matches) * MED_WEIGHT
+        score += len(low_matches) * LOW_WEIGHT
+
+        # Exclusive boost
+        if exclusive_matches:
+            score += EXCLUSIVE_BOOST * len(exclusive_matches)
+
+        # Class bonus (if strong signal)
+        if len(high_matches) >= 2:
+            score += CLASS_BONUS
+
+        # Proximity boost
+        all_keywords = set(high_matches + med_matches + low_matches)
+        score += proximity_score(text, all_keywords)
+
+        # Normalize
+        normalized_score = score / math.sqrt(word_count)
+
+        results[cls] = normalized_score
+
+    # Threshold filter
+    final = {k: v for k, v in results.items() if v >= THRESHOLD}
+
+    if not final:
+        return {"GENERIC_DOC": 1.0}
+
+    return final
+
+
+# -----------------------------
+# PROCESS FOLDER
+# -----------------------------
+
+def process_folder(folder_path):
+    output = {}
+
+    for file in os.listdir(folder_path):
+        if file.endswith(".pdf"):
+            path = os.path.join(folder_path, file)
+
+            print(f"Processing: {file}")
+
+            text = extract_text(path)
+            text = preprocess(text)
+
+            scores = score_document(text)
+
+            output[file] = scores
+
+    return output
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+
+if __name__ == "__main__":
+    folder_path = "pdfs"  # change this
+
+    results = process_folder(folder_path)
+
+    print("\nFINAL RESULTS:\n")
+    for doc, scores in results.items():
+        print(f"{doc}:")
+        for cls, score in scores.items():
+            print(f"  {cls}: {round(score, 3)}")
+        print()
