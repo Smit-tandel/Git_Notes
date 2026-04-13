@@ -1,539 +1,233 @@
 """
-PDF Binary Classifier — spaCy Edition
-======================================
-Classifies each PDF as INTERESTED or NOT_INTERESTED based on
-weighted keyword scoring with spaCy tokenisation & lemmatisation.
-
-Setup (run once):
-    pip install spacy pdfplumber openpyxl
-    python -m spacy download en_core_web_sm
-
-Usage:
-    python pdf_classifier_spacy.py                          # uses ./pdfs  → ./results.xlsx
-    python pdf_classifier_spacy.py /my/pdfs /my/out.xlsx   # custom paths
+PDF Classifier - Baseline Keyword Matching
+-------------------------------------------
+Given a folder of PDFs, this script extracts text, counts distinct keywords
+per class, and applies a threshold + bonus scoring system to assign a class.
 """
 
 import os
 import re
-import sys
-from collections import defaultdict
-from datetime import datetime
+from typing import Dict, List, Set, Tuple, Any
 
-import pdfplumber
-import spacy
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+import pdfplumber  # pip install pdfplumber
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 0.  CONFIGURATION  ←  EDIT THIS SECTION TO MATCH YOUR ACTUAL KEYWORDS
-# ──────────────────────────────────────────────────────────────────────────────
-
-PDF_FOLDER   = "./pdfs"
-OUTPUT_EXCEL = "./results.xlsx"
-
-# Score threshold above which a PDF is labelled INTERESTED
-# Tune this number up/down based on your results
-INTEREST_THRESHOLD = 8
-
-# Weights per tier
-WEIGHTS = {"HIGH": 3, "MED": 2, "LOW": 1}
-
-# ── Replace these with YOUR actual keywords ───────────────────────────────────
-
+# -----------------------------
+# GLOBAL KEYWORDS (WEIGHTED)
+# -----------------------------
 HIGH_KEYWORDS = {
-    "pan", "aadhaar", "passport",
-    "bank account", "ifsc", "credit card",
+    "pan",
+    "aadhaar",
+    "passport",
+    "bank account",
+    "ifsc",
+    "credit card number"
 }
 
 MED_KEYWORDS = {
-    "phone", "email", "transaction",
-    "balance", "salary", "payment", "invoice",
+    "phone number",
+    "email",
+    "transaction",
+    "balance",
+    "salary",
+    "payment"
 }
 
 LOW_KEYWORDS = {
-    "name", "address", "dob", "city", "country",
-    "report", "summary", "data", "information",
-    "amount", "date", "account",
+    "name",
+    "address",
+    "date of birth",
+    "city",
+    "country",
+    "report",
+    "summary",
+    "data",
+    "information"
 }
 
-# ── Regex overrides for tricky multi-word / abbreviated keywords ──────────────
-# Keys must match a keyword in HIGH/MED/LOW above.
-# If a keyword has no entry here, spaCy lemma matching is used instead.
-REGEX_PATTERNS: dict[str, str] = {
-    "pan":          r"\bpan\b|\bpan\s?(card|number|no\.?)\b",
-    "aadhaar":      r"\baadhaar\b|\baadhar\b|\buid\b",
-    "bank account": r"\bbank\s?acc(ount)?\b|\ba\/c\b|\baccount\s?no\.?\b",
-    "ifsc":         r"\bifsc\b|\bifsc\s?code\b",
-    "credit card":  r"\bcredit\s?card\b|\bcard\s?no\.?\b",
-    "dob":          r"\bd\.?o\.?b\.?\b|\bdate\s?of\s?birth\b|\bbirthdate\b",
-    "phone":        r"\bphone\b|\bmobile\b|\bcell\b|\bcontact\s?no\.?\b",
-    "email":        r"\bemail\b|\be-mail\b|\bmail\s?id\b",
-    "transaction":  r"\btransaction\b|\btxn\b",
-    "salary":       r"\bsalary\b|\bctc\b|\bpay\s?slip\b|\bwage\b",
-    "payment":      r"\bpayment\b|\bpaid\b",
-}
-
-# ── Proximity: if BOTH keywords in a pair appear within WINDOW words → bonus ──
-PROXIMITY_PAIRS: list[tuple[str, str]] = [
-    ("pan",    "aadhaar"),
-    ("pan",    "dob"),
-    ("ifsc",   "bank account"),
-    ("salary", "payment"),
-    ("transaction", "balance"),
-]
-PROXIMITY_WINDOW = 60   # words
-PROXIMITY_BONUS  = 4    # added to total score per triggered pair
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1.  BUILD LOOKUP STRUCTURES  (derived automatically — don't edit)
-# ──────────────────────────────────────────────────────────────────────────────
-
-ALL_KEYWORDS: dict[str, str] = {}   # keyword → tier
-for kw in HIGH_KEYWORDS: ALL_KEYWORDS[kw] = "HIGH"
-for kw in MED_KEYWORDS:  ALL_KEYWORDS[kw] = "MED"
-for kw in LOW_KEYWORDS:  ALL_KEYWORDS[kw] = "LOW"
-
-
-def _weight(kw: str) -> int:
-    return WEIGHTS[ALL_KEYWORDS.get(kw, "LOW")]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2.  LOAD spaCy MODEL
-# ──────────────────────────────────────────────────────────────────────────────
-
-print("Loading spaCy model…")
-nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])   # only need tokeniser + tagger for lemmas
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 3.  TEXT EXTRACTION
-# ──────────────────────────────────────────────────────────────────────────────
-
-def extract_text(path: str) -> tuple[str, int]:
-    """Return (raw_text_lowercase, page_count). Empty string on failure."""
-    try:
-        pages = []
-        with pdfplumber.open(path) as pdf:
-            n = len(pdf.pages)
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    pages.append(t)
-        return " ".join(pages).lower(), n
-    except Exception as exc:
-        print(f"  [WARN] {os.path.basename(path)}: {exc}")
-        return "", 0
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 4.  spaCy PREPROCESSING
-# ──────────────────────────────────────────────────────────────────────────────
-
-def preprocess(text: str) -> tuple[list[str], list[str]]:
-    """
-    Returns:
-        tokens  — original lowercase tokens (for regex proximity)
-        lemmas  — lemmatised tokens (for lemma keyword matching)
-    Strips punctuation-only tokens; keeps alphanumeric & hyphenated forms.
-    """
-    doc = nlp(text)
-    tokens, lemmas = [], []
-    for tok in doc:
-        if tok.is_space or tok.is_punct:
-            continue
-        tokens.append(tok.text.lower())
-        lemmas.append(tok.lemma_.lower())
-    return tokens, lemmas
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 5.  KEYWORD MATCHING
-# ──────────────────────────────────────────────────────────────────────────────
-
-def match_keywords(raw_text: str, tokens: list[str], lemmas: list[str]) -> dict[str, int]:
-    """
-    For each keyword:
-      • If a REGEX_PATTERN exists  → use regex on raw_text (best for multi-word / abbrevs)
-      • Otherwise                  → match against spaCy lemmas (handles inflections)
-    Returns {keyword: hit_count}
-    """
-    hits: dict[str, int] = {}
-
-    for kw in ALL_KEYWORDS:
-        if kw in REGEX_PATTERNS:
-            # Regex match on raw text
-            found = re.findall(REGEX_PATTERNS[kw], raw_text, re.IGNORECASE)
-            if found:
-                hits[kw] = len(found)
-        else:
-            # spaCy lemma match — handles "transactions" → "transaction", "balances" → "balance"
-            kw_lemma = nlp(kw)[0].lemma_.lower() if " " not in kw else kw
-            count = lemmas.count(kw_lemma)
-            if count:
-                hits[kw] = count
-
-    return hits
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 6.  PROXIMITY CHECK
-# ──────────────────────────────────────────────────────────────────────────────
-
-def proximity_check(tokens: list[str], kw1: str, kw2: str) -> bool:
-    """True if any occurrence of kw1 and kw2 are within PROXIMITY_WINDOW tokens."""
-    pat1 = REGEX_PATTERNS.get(kw1, re.escape(kw1))
-    pat2 = REGEX_PATTERNS.get(kw2, re.escape(kw2))
-    pos1 = [i for i, t in enumerate(tokens) if re.search(pat1, t, re.IGNORECASE)]
-    pos2 = [i for i, t in enumerate(tokens) if re.search(pat2, t, re.IGNORECASE)]
-    return any(abs(a - b) <= PROXIMITY_WINDOW for a in pos1 for b in pos2)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 7.  SCORING
-# ──────────────────────────────────────────────────────────────────────────────
-
-def score(hits: dict[str, int], tokens: list[str]) -> dict:
-    """
-    Returns a detailed score breakdown dict.
-
-    Scoring rules:
-      • Each matched keyword contributes its tier weight (H=3 M=2 L=1).
-        Capped at 1 occurrence to avoid frequency inflation.
-      • Each triggered proximity pair adds PROXIMITY_BONUS to the raw score.
-      • Raw score is then normalised by document length (per 100 tokens).
-    """
-    kw_contributions: dict[str, int] = {}
-    raw_kw_score = 0
-
-    for kw, count in hits.items():
-        w = _weight(kw)
-        kw_contributions[kw] = w       # capped: 1 hit per keyword
-        raw_kw_score += w
-
-    # Proximity bonuses
-    prox_hits: list[str] = []
-    prox_bonus_total = 0
-    for kw1, kw2 in PROXIMITY_PAIRS:
-        if kw1 in hits and kw2 in hits:
-            if proximity_check(tokens, kw1, kw2):
-                prox_hits.append(f"{kw1}+{kw2}")
-                prox_bonus_total += PROXIMITY_BONUS
-
-    raw_score = raw_kw_score + prox_bonus_total
-
-    # Normalise by document length
-    word_count    = len(tokens)
-    divisor       = max(word_count / 100, 1)
-    norm_score    = round(raw_score / divisor, 4)
-
-    # Binary decision
-    label      = "INTERESTED"     if norm_score >= INTEREST_THRESHOLD else "NOT_INTERESTED"
-    confidence = min(norm_score / (INTEREST_THRESHOLD * 2), 1.0)   # rough 0–1 scale
-
-    return {
-        "raw_kw_score":      raw_kw_score,
-        "prox_bonus":        prox_bonus_total,
-        "prox_pairs_hit":    ", ".join(prox_hits) if prox_hits else "—",
-        "raw_score":         raw_score,
-        "word_count":        word_count,
-        "norm_score":        norm_score,
-        "label":             label,
-        "confidence":        round(confidence, 3),
-        "kw_contributions":  kw_contributions,
+# -----------------------------
+# CLASS DEFINITIONS
+# -----------------------------
+CLASSES = {
+    "PERSONAL_INFO": {
+        "keywords": {
+            "pan", "aadhaar", "passport",
+            "phone number", "email",
+            "name", "address", "date of birth"
+        },
+        "threshold": 2,
+        "bonus": 10
+    },
+    "FINANCIAL_INFO": {
+        "keywords": {
+            "bank account", "ifsc", "credit card number",
+            "transaction", "balance", "salary", "payment",
+            "data"
+        },
+        "threshold": 2,
+        "bonus": 8
+    },
+    "GENERIC_DOC": {
+        "keywords": {
+            "report", "summary", "data", "information"
+        },
+        "threshold": 1,
+        "bonus": 2
     }
+}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 8.  PROCESS FOLDER
-# ──────────────────────────────────────────────────────────────────────────────
-
-def process_folder(folder: str) -> list[dict]:
-    pdfs = sorted(f for f in os.listdir(folder) if f.lower().endswith(".pdf"))
-    if not pdfs:
-        print(f"No PDFs found in '{folder}'")
+# ----------------------------------------------------------------------
+# PDF TEXT EXTRACTION (CHUNKING)
+# ----------------------------------------------------------------------
+def extract_chunks_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
+    """
+    Extract text from a PDF, returning a list of chunks.
+    Each chunk is a dict: {'text': str, 'id': int, 'pagespan': (int, int)}
+    Here we treat each page as a chunk. Adjust if you need smaller chunks.
+    """
+    chunks = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                text = page.extract_text()
+                if text:
+                    chunks.append({
+                        'text': text,
+                        'id': page_num - 1,          # 0‑based chunk id
+                        'pagespan': (page_num, page_num)
+                    })
+    except Exception as e:
+        print(f"Error reading {pdf_path}: {e}")
         return []
-
-    print(f"\nFound {len(pdfs)} PDF(s) in '{folder}'\n{'─'*55}")
-    records = []
-
-    for fname in pdfs:
-        path = os.path.join(folder, fname)
-        print(f"▸ {fname}")
-
-        raw_text, pages = extract_text(path)
-        if not raw_text.strip():
-            print("  [SKIP] No extractable text")
-            records.append({
-                "file":      fname,
-                "pages":     pages,
-                "label":     "UNREADABLE",
-                "confidence": 0.0,
-                "norm_score": 0.0,
-                "raw_score":  0.0,
-                "raw_kw_score": 0,
-                "prox_bonus": 0,
-                "prox_pairs_hit": "—",
-                "word_count": 0,
-                "matched_keywords": "",
-                "high_hits": "",
-                "med_hits":  "",
-                "low_hits":  "",
-                "kw_contributions": {},
-            })
-            continue
-
-        tokens, lemmas = preprocess(raw_text)
-        hits            = match_keywords(raw_text, tokens, lemmas)
-        result          = score(hits, tokens)
-
-        # Categorise matched keywords by tier for display
-        high_hits = [k for k in hits if ALL_KEYWORDS.get(k) == "HIGH"]
-        med_hits  = [k for k in hits if ALL_KEYWORDS.get(k) == "MED"]
-        low_hits  = [k for k in hits if ALL_KEYWORDS.get(k) == "LOW"]
-
-        print(f"  Pages={pages} | Words={result['word_count']} | "
-              f"RawScore={result['raw_score']} | NormScore={result['norm_score']} | "
-              f"→ {result['label']} ({result['confidence']:.2f})")
-
-        records.append({
-            "file":             fname,
-            "pages":            pages,
-            "label":            result["label"],
-            "confidence":       result["confidence"],
-            "norm_score":       result["norm_score"],
-            "raw_score":        result["raw_score"],
-            "raw_kw_score":     result["raw_kw_score"],
-            "prox_bonus":       result["prox_bonus"],
-            "prox_pairs_hit":   result["prox_pairs_hit"],
-            "word_count":       result["word_count"],
-            "matched_keywords": ", ".join(
-                f"{k}({'H' if ALL_KEYWORDS[k]=='HIGH' else 'M' if ALL_KEYWORDS[k]=='MED' else 'L'})"
-                for k in sorted(hits)
-            ),
-            "high_hits":  ", ".join(high_hits) or "—",
-            "med_hits":   ", ".join(med_hits)  or "—",
-            "low_hits":   ", ".join(low_hits)  or "—",
-            "kw_contributions": result["kw_contributions"],
-        })
-
-    print(f"{'─'*55}")
-    interested = sum(1 for r in records if r["label"] == "INTERESTED")
-    print(f"Summary: {interested}/{len(records)} PDFs labelled INTERESTED\n")
-    return records
+    return chunks
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 9.  EXCEL OUTPUT
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Style constants
-HDR_FILL  = PatternFill("solid", fgColor="1F3864")
-HDR_FONT  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-HDR_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-LABEL_COLORS = {
-    "INTERESTED":     "D9EAD3",   # green tint
-    "NOT_INTERESTED": "FCE5CD",   # orange tint
-    "UNREADABLE":     "F4CCCC",   # red tint
-}
-LABEL_FONT_COLORS = {
-    "INTERESTED":     "274E13",
-    "NOT_INTERESTED": "783F04",
-    "UNREADABLE":     "CC0000",
-}
-
-def _thin_border():
-    s = Side(style="thin", color="CCCCCC")
-    return Border(left=s, right=s, top=s, bottom=s)
+def extract_chunks_from_folder(folder_path: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Process all PDFs in a folder and return a dict:
+        {pdf_filename: [list_of_chunk_dicts]}
+    """
+    pdf_chunks = {}
+    for filename in os.listdir(folder_path):
+        if filename.lower().endswith('.pdf'):
+            pdf_path = os.path.join(folder_path, filename)
+            chunks = extract_chunks_from_pdf(pdf_path)
+            if chunks:
+                pdf_chunks[filename] = chunks
+    return pdf_chunks
 
 
-def _header_row(ws, headers: list[str]):
-    ws.append(headers)
-    for col, _ in enumerate(headers, 1):
-        c = ws.cell(row=1, column=col)
-        c.fill, c.font, c.alignment = HDR_FILL, HDR_FONT, HDR_ALIGN
-        c.border = _thin_border()
-    ws.row_dimensions[1].height = 28
-    ws.freeze_panes = "A2"
+# ----------------------------------------------------------------------
+# KEYWORD MATCHING HELPERS
+# ----------------------------------------------------------------------
+def get_matched_keywords(text: str, class_keywords: Set[str]) -> Set[str]:
+    """
+    Return a set of distinct, case‑insensitive keyword matches found in the text.
+    Handles multi‑word phrases correctly.
+    """
+    found = set()
+    # Sort by length descending so longer phrases match before shorter sub‑phrases
+    sorted_keywords = sorted(class_keywords, key=len, reverse=True)
+    # Build regex with word boundaries
+    pattern = re.compile(
+        r'\b(' + '|'.join(re.escape(k) for k in sorted_keywords) + r')\b',
+        re.IGNORECASE
+    )
+    for match in pattern.finditer(text):
+        found.add(match.group().lower())
+    return found
 
 
-def _set_widths(ws, widths: list[int]):
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+def get_distinct_keywords_for_pdf(
+    chunks: List[Dict[str, Any]], class_keywords: Set[str]
+) -> Set[str]:
+    """
+    Aggregate distinct matched keywords across all chunks of a PDF.
+    """
+    all_found = set()
+    for chunk in chunks:
+        all_found.update(get_matched_keywords(chunk['text'], class_keywords))
+    return all_found
 
 
-def save_excel(records: list[dict], output_path: str):
-    wb = openpyxl.Workbook()
+# ----------------------------------------------------------------------
+# CLASSIFICATION LOGIC
+# ----------------------------------------------------------------------
+def classify_single_pdf(chunks: List[Dict[str, Any]], classes_dict: Dict) -> Tuple[Dict, str]:
+    """
+    For each class:
+      - Find distinct matched keywords.
+      - Triggered if distinct count >= threshold.
+      - Final score = distinct count + bonus (if triggered).
+    Returns a tuple: (detailed results per class, predicted class name).
+    """
+    results = {}
 
-    # ── Sheet 1: Main Results ─────────────────────────────────────────────────
-    ws1 = wb.active
-    ws1.title = "Results"
+    for class_name, config in classes_dict.items():
+        keywords_set = config['keywords']
+        matched = get_distinct_keywords_for_pdf(chunks, keywords_set)
+        distinct_count = len(matched)
+        triggered = distinct_count >= config['threshold']
+        final_score = distinct_count + config['bonus'] if triggered else distinct_count
 
-    headers1 = [
-        "File Name", "Pages", "Word Count",
-        "Label", "Confidence",
-        "Norm Score", "Raw Score", "KW Score", "Proximity Bonus",
-        "Proximity Pairs Hit",
-        "Matched Keywords (all)",
-        "HIGH hits", "MED hits", "LOW hits",
+        results[class_name] = {
+            'matched_keywords': matched,
+            'distinct_count': distinct_count,
+            'threshold': config['threshold'],
+            'triggered': triggered,
+            'final_score': final_score
+        }
+
+    # Determine predicted class: triggered class with highest final_score
+    triggered_classes = [
+        (name, data['final_score'])
+        for name, data in results.items()
+        if data['triggered']
     ]
-    _header_row(ws1, headers1)
+    if triggered_classes:
+        predicted = max(triggered_classes, key=lambda x: x[1])[0]
+    else:
+        predicted = 'OTHER'
 
-    for rec in records:
-        label = rec["label"]
-        row = [
-            rec["file"], rec["pages"], rec["word_count"],
-            label, rec["confidence"],
-            rec["norm_score"], rec["raw_score"],
-            rec["raw_kw_score"], rec["prox_bonus"],
-            rec["prox_pairs_hit"],
-            rec["matched_keywords"],
-            rec["high_hits"], rec["med_hits"], rec["low_hits"],
-        ]
-        ws1.append(row)
-        r = ws1.max_row
-        fill  = PatternFill("solid", fgColor=LABEL_COLORS.get(label, "FFFFFF"))
-        bdr   = _thin_border()
-
-        for col in range(1, len(headers1) + 1):
-            cell = ws1.cell(row=r, column=col)
-            cell.fill   = fill
-            cell.border = bdr
-            cell.font   = Font(name="Arial", size=9)
-            cell.alignment = Alignment(vertical="center", wrap_text=(col in (11, 12, 13, 14)))
-
-        # Label cell gets its own font colour
-        lbl_cell = ws1.cell(row=r, column=4)
-        lbl_cell.font = Font(
-            bold=True, name="Arial", size=9,
-            color=LABEL_FONT_COLORS.get(label, "000000")
-        )
-        ws1.cell(row=r, column=5).number_format = "0.000"
-        ws1.cell(row=r, column=6).number_format = "0.0000"
-
-    _set_widths(ws1, [38, 7, 10, 16, 11, 11, 10, 10, 16, 28, 55, 22, 22, 22])
-
-    # ── Sheet 2: Keyword Score Breakdown (one row per keyword per file) ───────
-    ws2 = wb.create_sheet("Keyword Breakdown")
-    headers2 = ["File Name", "Keyword", "Tier", "Weight", "Hit?", "Score Contribution"]
-    _header_row(ws2, headers2)
-
-    tier_colors = {"HIGH": "EA9999", "MED": "FFE599", "LOW": "D9D2E9"}
-
-    for rec in records:
-        contribs = rec.get("kw_contributions", {})
-        for kw in sorted(ALL_KEYWORDS):
-            tier   = ALL_KEYWORDS[kw]
-            weight = _weight(kw)
-            hit    = kw in contribs
-            ws2.append([
-                rec["file"], kw, tier, weight,
-                "YES" if hit else "no",
-                contribs.get(kw, 0),
-            ])
-            r    = ws2.max_row
-            fill = PatternFill("solid", fgColor=tier_colors[tier] if hit else "F3F3F3")
-            bdr  = _thin_border()
-            for col in range(1, 7):
-                cell = ws2.cell(row=r, column=col)
-                cell.fill, cell.border = fill, bdr
-                cell.font  = Font(name="Arial", size=9,
-                                  bold=(col == 5 and hit),
-                                  color="006100" if hit and col == 5 else "000000")
-                cell.alignment = Alignment(vertical="center")
-
-    _set_widths(ws2, [38, 22, 8, 8, 6, 18])
-
-    # ── Sheet 3: Summary stats ────────────────────────────────────────────────
-    ws3 = wb.create_sheet("Summary")
-
-    total       = len(records)
-    interested  = sum(1 for r in records if r["label"] == "INTERESTED")
-    not_int     = sum(1 for r in records if r["label"] == "NOT_INTERESTED")
-    unreadable  = sum(1 for r in records if r["label"] == "UNREADABLE")
-    avg_norm    = (sum(r["norm_score"] for r in records) / total) if total else 0
-
-    stats = [
-        ("Generated",             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        ("PDF Folder",            PDF_FOLDER),
-        ("Interest Threshold",    INTEREST_THRESHOLD),
-        ("", ""),
-        ("Total PDFs",            total),
-        ("INTERESTED",            interested),
-        ("NOT_INTERESTED",        not_int),
-        ("UNREADABLE",            unreadable),
-        ("Avg Norm Score",        round(avg_norm, 4)),
-        ("", ""),
-        ("HIGH keywords defined", len(HIGH_KEYWORDS)),
-        ("MED keywords defined",  len(MED_KEYWORDS)),
-        ("LOW keywords defined",  len(LOW_KEYWORDS)),
-        ("Proximity pairs",       len(PROXIMITY_PAIRS)),
-    ]
-
-    ws3["A1"], ws3["B1"] = "Metric", "Value"
-    for col in (1, 2):
-        c = ws3.cell(row=1, column=col)
-        c.fill, c.font, c.alignment = HDR_FILL, HDR_FONT, HDR_ALIGN
-    ws3.row_dimensions[1].height = 28
-
-    for metric, value in stats:
-        ws3.append([metric, value])
-        r = ws3.max_row
-        for col in (1, 2):
-            cell = ws3.cell(row=r, column=col)
-            cell.font  = Font(name="Arial", size=9, bold=(col == 1 and metric))
-            cell.alignment = Alignment(vertical="center")
-            cell.border = _thin_border()
-        if metric in ("INTERESTED", "NOT_INTERESTED"):
-            color = "D9EAD3" if metric == "INTERESTED" else "FCE5CD"
-            ws3.cell(row=r, column=2).fill = PatternFill("solid", fgColor=color)
-
-    _set_widths(ws3, [28, 30])
-
-    # ── Legend ────────────────────────────────────────────────────────────────
-    ws4 = wb.create_sheet("Legend")
-    legend_items = [
-        ("INTERESTED row",     "D9EAD3", "000000"),
-        ("NOT_INTERESTED row", "FCE5CD", "000000"),
-        ("UNREADABLE row",     "F4CCCC", "000000"),
-        ("HIGH keyword hit",   "EA9999", "000000"),
-        ("MED keyword hit",    "FFE599", "000000"),
-        ("LOW keyword hit",    "D9D2E9", "000000"),
-    ]
-    ws4["A1"] = "Legend"
-    ws4["A1"].font = Font(bold=True, name="Arial", size=11)
-    ws4.append([])
-    for label, bg, fg in legend_items:
-        ws4.append([label])
-        c = ws4.cell(row=ws4.max_row, column=1)
-        c.fill = PatternFill("solid", fgColor=bg)
-        c.font = Font(name="Arial", size=10, color=fg)
-        c.border = _thin_border()
-    ws4.column_dimensions["A"].width = 28
-
-    ws4.append([])
-    ws4.append(["Norm Score = Raw Score ÷ (word_count / 100)"])
-    ws4.append([f"Interest Threshold = {INTEREST_THRESHOLD}"])
-    ws4.append(["Confidence = min(norm_score / (threshold × 2), 1.0)"])
-
-    wb.save(output_path)
-    print(f"✅ Saved → {output_path}")
+    return results, predicted
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────────────────────────────────────
+def classify_all_pdfs(folder_path: str) -> Dict[str, Any]:
+    """
+    Main function: extract chunks from folder, classify each PDF,
+    return a dict with full results.
+    """
+    pdf_chunks_dict = extract_chunks_from_folder(folder_path)
+    all_results = {}
 
+    for pdf_name, chunks in pdf_chunks_dict.items():
+        details, predicted = classify_single_pdf(chunks, CLASSES)
+        all_results[pdf_name] = {
+            'class_details': details,
+            'predicted_class': predicted
+        }
+
+    return all_results
+
+
+# ----------------------------------------------------------------------
+# EXAMPLE USAGE
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    folder = sys.argv[1] if len(sys.argv) > 1 else PDF_FOLDER
-    output = sys.argv[2] if len(sys.argv) > 2 else OUTPUT_EXCEL
+    # Replace with the path to your folder containing PDFs
+    FOLDER_PATH = "/path/to/your/pdf/folder"
 
-    if not os.path.isdir(folder):
-        print(f"ERROR: '{folder}' not found.")
-        sys.exit(1)
+    if not os.path.exists(FOLDER_PATH):
+        print(f"Folder not found: {FOLDER_PATH}")
+    else:
+        results = classify_all_pdfs(FOLDER_PATH)
 
-    records = process_folder(folder)
-    if records:
-        save_excel(records, output)
+        # Print results in a readable format
+        for pdf_name, data in results.items():
+            print(f"\n=== {pdf_name} ===")
+            print(f"Predicted class: {data['predicted_class']}")
+            for class_name, details in data['class_details'].items():
+                print(f"  {class_name}:")
+                print(f"    Distinct matched: {details['distinct_count']} -> {details['matched_keywords']}")
+                print(f"    Threshold: {details['threshold']} | Triggered: {details['triggered']}")
+                print(f"    Final score: {details['final_score']}")
