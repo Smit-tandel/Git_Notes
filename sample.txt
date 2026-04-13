@@ -2,47 +2,29 @@ import os
 import re
 import math
 import pdfplumber
-from collections import defaultdict
-from itertools import combinations
+
+from keywords_config import (
+    HIGH_KEYWORDS,
+    MED_KEYWORDS,
+    LOW_KEYWORDS,
+    CLASSES
+)
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 
-HIGH_WEIGHT = 3
-MED_WEIGHT = 2
-LOW_WEIGHT = 1
-
-PROXIMITY_WINDOW = 20  # max word distance
-PROXIMITY_BOOST = 2
-CLASS_BONUS = 2
-EXCLUSIVE_BOOST = 3
-
-THRESHOLD = 0.15  # normalized threshold
-
-
-# -----------------------------
-# KEYWORDS (example)
-# -----------------------------
-
-CLASSES = {
-    "FINANCIAL": {
-        "high": {"pan", "aadhaar", "bank account"},
-        "medium": {"transaction", "balance", "salary"},
-        "low": {"amount", "credit", "debit"},
-        "exclusive": {"ifsc"}
-    },
-    "PERSONAL": {
-        "high": {"passport"},
-        "medium": {"email", "phone number"},
-        "low": {"address", "name"},
-        "exclusive": {"ssn"}
-    }
+WEIGHTS = {
+    "HIGH": 3,
+    "MED": 2,
+    "LOW": 1
 }
 
+THRESHOLD = 0.15  # final normalized threshold
+
 
 # -----------------------------
-# PDF TEXT EXTRACTION
+# TEXT EXTRACTION
 # -----------------------------
 
 def extract_text(pdf_path):
@@ -54,7 +36,7 @@ def extract_text(pdf_path):
 
 
 # -----------------------------
-# PREPROCESSING
+# PREPROCESS
 # -----------------------------
 
 def preprocess(text):
@@ -65,89 +47,72 @@ def preprocess(text):
 
 
 # -----------------------------
-# REGEX MATCHING
+# DETERMINE KEYWORD LEVEL
 # -----------------------------
 
-def regex_match(text, keywords):
-    matches = []
+def get_keyword_weight(keyword):
+    if keyword in HIGH_KEYWORDS:
+        return WEIGHTS["HIGH"]
+    elif keyword in MED_KEYWORDS:
+        return WEIGHTS["MED"]
+    elif keyword in LOW_KEYWORDS:
+        return WEIGHTS["LOW"]
+    return 0
+
+
+# -----------------------------
+# REGEX MATCH
+# -----------------------------
+
+def find_matches(text, keywords):
+    found = []
     for kw in keywords:
         pattern = r"\b" + re.escape(kw) + r"\b"
         if re.search(pattern, text):
-            matches.append(kw)
-    return matches
+            found.append(kw)
+    return found
 
 
 # -----------------------------
-# PROXIMITY BOOST
-# -----------------------------
-
-def proximity_score(text, keywords):
-    words = text.split()
-    positions = defaultdict(list)
-
-    for idx, word in enumerate(words):
-        if word in keywords:
-            positions[word].append(idx)
-
-    score = 0
-
-    for w1, w2 in combinations(positions.keys(), 2):
-        for p1 in positions[w1]:
-            for p2 in positions[w2]:
-                if abs(p1 - p2) <= PROXIMITY_WINDOW:
-                    score += PROXIMITY_BOOST
-
-    return score
-
-
-# -----------------------------
-# SCORING FUNCTION
+# SCORING
 # -----------------------------
 
 def score_document(text):
     results = {}
-
     word_count = len(text.split())
+
     if word_count == 0:
         return {"GENERIC_DOC": 1.0}
 
-    for cls, data in CLASSES.items():
+    for cls_name, cls_data in CLASSES.items():
+        keywords = cls_data["keywords"]
+        threshold = cls_data["threshold"]
+        bonus = cls_data["bonus"]
+
+        matches = find_matches(text, keywords)
+
         score = 0
 
-        high_matches = regex_match(text, data["high"])
-        med_matches = regex_match(text, data["medium"])
-        low_matches = regex_match(text, data["low"])
-        exclusive_matches = regex_match(text, data["exclusive"])
+        # Weighted scoring
+        for kw in matches:
+            score += get_keyword_weight(kw)
 
-        # Base score
-        score += len(high_matches) * HIGH_WEIGHT
-        score += len(med_matches) * MED_WEIGHT
-        score += len(low_matches) * LOW_WEIGHT
-
-        # Exclusive boost
-        if exclusive_matches:
-            score += EXCLUSIVE_BOOST * len(exclusive_matches)
-
-        # Class bonus (if strong signal)
-        if len(high_matches) >= 2:
-            score += CLASS_BONUS
-
-        # Proximity boost
-        all_keywords = set(high_matches + med_matches + low_matches)
-        score += proximity_score(text, all_keywords)
+        # Threshold bonus
+        if len(matches) >= threshold:
+            score += bonus
 
         # Normalize
         normalized_score = score / math.sqrt(word_count)
 
-        results[cls] = normalized_score
+        results[cls_name] = normalized_score
 
-    # Threshold filter
-    final = {k: v for k, v in results.items() if v >= THRESHOLD}
+    # Apply final threshold filter
+    filtered = {k: v for k, v in results.items() if v >= THRESHOLD}
 
-    if not final:
+    if not filtered:
         return {"GENERIC_DOC": 1.0}
 
-    return final
+    return filtered
 
 
 # -----------------------------
@@ -155,7 +120,7 @@ def score_document(text):
 # -----------------------------
 
 def process_folder(folder_path):
-    output = {}
+    final_output = {}
 
     for file in os.listdir(folder_path):
         if file.endswith(".pdf"):
@@ -168,9 +133,9 @@ def process_folder(folder_path):
 
             scores = score_document(text)
 
-            output[file] = scores
+            final_output[file] = scores
 
-    return output
+    return final_output
 
 
 # -----------------------------
@@ -183,6 +148,7 @@ if __name__ == "__main__":
     results = process_folder(folder_path)
 
     print("\nFINAL RESULTS:\n")
+
     for doc, scores in results.items():
         print(f"{doc}:")
         for cls, score in scores.items():
