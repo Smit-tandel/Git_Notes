@@ -1,18 +1,26 @@
 """
-PDF Classifier - Baseline Keyword Matching
--------------------------------------------
-Given a folder of PDFs, this script extracts text, counts distinct keywords
-per class, and applies a threshold + bonus scoring system to assign a class.
+PDF Multi‑Class Classifier – Weighted Scoring + Proximity Check
+----------------------------------------------------------------
+- Extracts text from PDFs (one chunk per page).
+- Matches multi‑word phrases exactly, case‑insensitive.
+- Uses HIGH (10), MED (5), LOW (2) weights.
+- For each class:
+    1. Find distinct keywords across all chunks.
+    2. If distinct count >= threshold, check proximity:
+       - Do at least `threshold` distinct keywords appear within a window of 3 chunks?
+    3. Class is triggered only if both conditions hold.
+- Returns list of predicted classes and detailed scores.
 """
 
 import os
 import re
-from typing import Dict, List, Set, Tuple, Any
+from typing import Dict, List, Set, Tuple, Any, DefaultDict
+from collections import defaultdict
 
 import pdfplumber  # pip install pdfplumber
 
 # -----------------------------
-# GLOBAL KEYWORDS (WEIGHTED)
+# GLOBAL KEYWORDS & WEIGHTS
 # -----------------------------
 HIGH_KEYWORDS = {
     "pan",
@@ -44,6 +52,14 @@ LOW_KEYWORDS = {
     "information"
 }
 
+TIER_WEIGHTS = {}
+for kw in HIGH_KEYWORDS:
+    TIER_WEIGHTS[kw] = 10
+for kw in MED_KEYWORDS:
+    TIER_WEIGHTS[kw] = 5
+for kw in LOW_KEYWORDS:
+    TIER_WEIGHTS[kw] = 2
+
 # -----------------------------
 # CLASS DEFINITIONS
 # -----------------------------
@@ -54,8 +70,7 @@ CLASSES = {
             "phone number", "email",
             "name", "address", "date of birth"
         },
-        "threshold": 2,
-        "bonus": 10
+        "threshold": 2
     },
     "FINANCIAL_INFO": {
         "keywords": {
@@ -63,28 +78,40 @@ CLASSES = {
             "transaction", "balance", "salary", "payment",
             "data"
         },
-        "threshold": 2,
-        "bonus": 8
+        "threshold": 2
     },
     "GENERIC_DOC": {
         "keywords": {
             "report", "summary", "data", "information"
         },
-        "threshold": 1,
-        "bonus": 2
+        "threshold": 1
     }
 }
+
+# Normalisation threshold (adjust as needed)
+NORM_THRESHOLD = 0.3
+# Proximity window size in chunks (pages)
+PROXIMITY_WINDOW = 3
+
+
+# ----------------------------------------------------------------------
+# PRE‑COMPUTE CLASS MAX SCORES
+# ----------------------------------------------------------------------
+def compute_class_max_scores() -> Dict[str, float]:
+    max_scores = {}
+    for cls_name, config in CLASSES.items():
+        total = sum(TIER_WEIGHTS.get(kw, 0) for kw in config["keywords"])
+        max_scores[cls_name] = total
+    return max_scores
+
+CLASS_MAX_SCORES = compute_class_max_scores()
 
 
 # ----------------------------------------------------------------------
 # PDF TEXT EXTRACTION (CHUNKING)
 # ----------------------------------------------------------------------
 def extract_chunks_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
-    """
-    Extract text from a PDF, returning a list of chunks.
-    Each chunk is a dict: {'text': str, 'id': int, 'pagespan': (int, int)}
-    Here we treat each page as a chunk. Adjust if you need smaller chunks.
-    """
+    """Extract text from PDF, each page becomes one chunk."""
     chunks = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -103,10 +130,7 @@ def extract_chunks_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
 
 
 def extract_chunks_from_folder(folder_path: str) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Process all PDFs in a folder and return a dict:
-        {pdf_filename: [list_of_chunk_dicts]}
-    """
+    """Process all PDFs in a folder."""
     pdf_chunks = {}
     for filename in os.listdir(folder_path):
         if filename.lower().endswith('.pdf'):
@@ -118,116 +142,178 @@ def extract_chunks_from_folder(folder_path: str) -> Dict[str, List[Dict[str, Any
 
 
 # ----------------------------------------------------------------------
-# KEYWORD MATCHING HELPERS
+# KEYWORD MATCHING WITH POSITION TRACKING
 # ----------------------------------------------------------------------
-def get_matched_keywords(text: str, class_keywords: Set[str]) -> Set[str]:
+def get_matched_keywords_with_positions(
+    text: str, class_keywords: Set[str], chunk_id: int
+) -> Dict[str, Set[int]]:
     """
-    Return a set of distinct, case‑insensitive keyword matches found in the text.
-    Handles multi‑word phrases correctly.
+    Return a dict: keyword -> set of chunk IDs where it appears.
+    (Here each call handles one chunk, so we just add the chunk_id.)
     """
-    found = set()
-    # Sort by length descending so longer phrases match before shorter sub‑phrases
+    found = {}
     sorted_keywords = sorted(class_keywords, key=len, reverse=True)
-    # Build regex with word boundaries
     pattern = re.compile(
         r'\b(' + '|'.join(re.escape(k) for k in sorted_keywords) + r')\b',
         re.IGNORECASE
     )
     for match in pattern.finditer(text):
-        found.add(match.group().lower())
+        kw = match.group().lower()
+        if kw not in found:
+            found[kw] = set()
+        found[kw].add(chunk_id)
     return found
 
 
-def get_distinct_keywords_for_pdf(
+def get_keyword_positions_for_pdf(
     chunks: List[Dict[str, Any]], class_keywords: Set[str]
-) -> Set[str]:
+) -> Tuple[Set[str], Dict[str, Set[int]]]:
     """
-    Aggregate distinct matched keywords across all chunks of a PDF.
+    Process all chunks and return:
+        - set of distinct keywords found
+        - dict: keyword -> set of chunk IDs where it appears
     """
-    all_found = set()
+    distinct_keywords = set()
+    kw_to_chunks = defaultdict(set)
+
     for chunk in chunks:
-        all_found.update(get_matched_keywords(chunk['text'], class_keywords))
-    return all_found
+        chunk_id = chunk['id']
+        matches = get_matched_keywords_with_positions(
+            chunk['text'], class_keywords, chunk_id
+        )
+        for kw, chunk_set in matches.items():
+            distinct_keywords.add(kw)
+            kw_to_chunks[kw].update(chunk_set)
+
+    return distinct_keywords, dict(kw_to_chunks)
 
 
 # ----------------------------------------------------------------------
-# CLASSIFICATION LOGIC
+# PROXIMITY CHECK
 # ----------------------------------------------------------------------
-def classify_single_pdf(chunks: List[Dict[str, Any]], classes_dict: Dict) -> Tuple[Dict, str]:
+def check_proximity(
+    kw_to_chunks: Dict[str, Set[int]], threshold: int, window_size: int = 3
+) -> bool:
+    """
+    Determine if there exists a window of `window_size` consecutive chunk IDs
+    that contains at least `threshold` distinct keywords.
+    """
+    if not kw_to_chunks:
+        return False
+
+    # Collect all chunk IDs that contain any keyword
+    all_chunk_ids = set()
+    for chunk_set in kw_to_chunks.values():
+        all_chunk_ids.update(chunk_set)
+
+    if not all_chunk_ids:
+        return False
+
+    min_chunk = min(all_chunk_ids)
+    max_chunk = max(all_chunk_ids)
+
+    # Slide a window of length `window_size`
+    for start in range(min_chunk, max_chunk + 1):
+        end = start + window_size - 1
+        # Count distinct keywords that appear in this window
+        count = 0
+        for kw, chunks in kw_to_chunks.items():
+            if any(start <= cid <= end for cid in chunks):
+                count += 1
+                if count >= threshold:
+                    return True
+    return False
+
+
+# ----------------------------------------------------------------------
+# SCORING & CLASSIFICATION (WITH PROXIMITY)
+# ----------------------------------------------------------------------
+def score_single_pdf(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     For each class:
-      - Find distinct matched keywords.
-      - Triggered if distinct count >= threshold.
-      - Final score = distinct count + bonus (if triggered).
-    Returns a tuple: (detailed results per class, predicted class name).
+        - Get distinct keywords and their chunk positions.
+        - Calculate raw_score and norm_score.
+        - Check threshold: distinct count >= class threshold.
+        - If threshold met, check proximity (at least threshold keywords within 3 chunks).
+        - Class is triggered only if both conditions hold.
     """
     results = {}
+    predicted_classes = []
 
-    for class_name, config in classes_dict.items():
-        keywords_set = config['keywords']
-        matched = get_distinct_keywords_for_pdf(chunks, keywords_set)
-        distinct_count = len(matched)
-        triggered = distinct_count >= config['threshold']
-        final_score = distinct_count + config['bonus'] if triggered else distinct_count
+    for cls_name, config in CLASSES.items():
+        keywords_set = config["keywords"]
+        threshold = config["threshold"]
 
-        results[class_name] = {
-            'matched_keywords': matched,
+        distinct_kws, kw_to_chunks = get_keyword_positions_for_pdf(chunks, keywords_set)
+        distinct_count = len(distinct_kws)
+
+        # Raw and normalised scores (based on all matched keywords)
+        raw_score = sum(TIER_WEIGHTS.get(kw, 0) for kw in distinct_kws)
+        max_score = CLASS_MAX_SCORES[cls_name]
+        norm_score = raw_score / max_score if max_score > 0 else 0.0
+
+        # Condition 1: distinct count meets threshold
+        threshold_met = distinct_count >= threshold
+
+        # Condition 2: proximity check (only if threshold met)
+        proximity_ok = False
+        if threshold_met:
+            proximity_ok = check_proximity(kw_to_chunks, threshold, PROXIMITY_WINDOW)
+
+        triggered = threshold_met and proximity_ok and (norm_score >= NORM_THRESHOLD)
+
+        if triggered:
+            predicted_classes.append(cls_name)
+
+        results[cls_name] = {
+            'matched_keywords': distinct_kws,
             'distinct_count': distinct_count,
-            'threshold': config['threshold'],
-            'triggered': triggered,
-            'final_score': final_score
+            'raw_score': raw_score,
+            'max_possible': max_score,
+            'norm_score': round(norm_score, 3),
+            'threshold_met': threshold_met,
+            'proximity_ok': proximity_ok,
+            'triggered': triggered
         }
 
-    # Determine predicted class: triggered class with highest final_score
-    triggered_classes = [
-        (name, data['final_score'])
-        for name, data in results.items()
-        if data['triggered']
-    ]
-    if triggered_classes:
-        predicted = max(triggered_classes, key=lambda x: x[1])[0]
-    else:
-        predicted = 'OTHER'
-
-    return results, predicted
+    return results, predicted_classes
 
 
 def classify_all_pdfs(folder_path: str) -> Dict[str, Any]:
-    """
-    Main function: extract chunks from folder, classify each PDF,
-    return a dict with full results.
-    """
     pdf_chunks_dict = extract_chunks_from_folder(folder_path)
     all_results = {}
 
     for pdf_name, chunks in pdf_chunks_dict.items():
-        details, predicted = classify_single_pdf(chunks, CLASSES)
+        details, predicted = score_single_pdf(chunks)
         all_results[pdf_name] = {
             'class_details': details,
-            'predicted_class': predicted
+            'predicted_classes': predicted
         }
 
     return all_results
 
 
 # ----------------------------------------------------------------------
-# EXAMPLE USAGE
+# MAIN / EXAMPLE
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # Replace with the path to your folder containing PDFs
-    FOLDER_PATH = "/path/to/your/pdf/folder"
+    FOLDER_PATH = "/path/to/your/pdf/folder"   # <-- CHANGE THIS
 
     if not os.path.exists(FOLDER_PATH):
         print(f"Folder not found: {FOLDER_PATH}")
     else:
         results = classify_all_pdfs(FOLDER_PATH)
 
-        # Print results in a readable format
         for pdf_name, data in results.items():
-            print(f"\n=== {pdf_name} ===")
-            print(f"Predicted class: {data['predicted_class']}")
-            for class_name, details in data['class_details'].items():
-                print(f"  {class_name}:")
-                print(f"    Distinct matched: {details['distinct_count']} -> {details['matched_keywords']}")
-                print(f"    Threshold: {details['threshold']} | Triggered: {details['triggered']}")
-                print(f"    Final score: {details['final_score']}")
+            print(f"\n{'='*50}")
+            print(f"PDF: {pdf_name}")
+            print(f"Predicted classes: {data['predicted_classes'] if data['predicted_classes'] else 'OTHER'}")
+            print("-" * 40)
+            for cls_name, det in data['class_details'].items():
+                status = "✓" if det['triggered'] else "✗"
+                print(f"{status} {cls_name}:")
+                print(f"    Matched keywords: {det['matched_keywords']}")
+                print(f"    Distinct count: {det['distinct_count']} (threshold: {CLASSES[cls_name]['threshold']})")
+                print(f"    Threshold met: {det['threshold_met']}, Proximity OK: {det['proximity_ok']}")
+                print(f"    Raw score: {det['raw_score']} / {det['max_possible']}")
+                print(f"    Normalised: {det['norm_score']}")
