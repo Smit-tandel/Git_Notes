@@ -1,199 +1,174 @@
 import os
-import re
-import fitz  # PyMuPDF
-import pytesseract
-from PIL import Image
+import pickle
+import numpy as np
+import pdfplumber
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
-# =========================
+# OCR imports
+import pytesseract
+from pdf2image import convert_from_path
+
+# ---------------------------
 # CONFIG
-# =========================
+# ---------------------------
+MODEL_NAME = "all-MiniLM-L6-v2"
+STORE_PATH = "pos_store.pkl"
+MIN_WORDS_PER_PAGE = 20
 
-PDF_FOLDER = "pdfs"  # change this
+model = SentenceTransformer(MODEL_NAME)
 
-STRONG_KEYWORDS = ["subscription agreement"]
-MEDIUM_KEYWORDS = [
-    "subscriber", "subscription", "purchase price",
-    "securities", "shares", "offering"
-]
-WEAK_KEYWORDS = ["agreement", "payment", "company"]
 
-PHRASES = [
-    r"subscriber hereby subscribes",
-    r"purchase of securities",
-    r"subject to the terms and conditions"
-]
+# ---------------------------
+# TEXT EXTRACTION (HYBRID)
+# ---------------------------
+def extract_text_with_fallback(pdf_path):
+    """
+    Try pdfplumber first.
+    If page has low text → fallback to OCR.
+    """
+    pages = []
 
-REFERENCE_TEXTS = [
-    "subscription agreement for securities purchase",
-    "investor subscribes to shares in offering",
-    "legal agreement for buying equity shares"
-]
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text()
 
-# =========================
-# LOAD MODEL
-# =========================
+            # If good text → use it
+            if text and len(text.split()) > MIN_WORDS_PER_PAGE:
+                pages.append((i + 1, text.strip()))
+            else:
+                # OCR fallback
+                print(f"OCR fallback on page {i+1} of {os.path.basename(pdf_path)}")
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
-ref_embeddings = model.encode(REFERENCE_TEXTS)
+                images = convert_from_path(
+                    pdf_path,
+                    first_page=i+1,
+                    last_page=i+1
+                )
 
-# =========================
-# PDF TEXT EXTRACTION
-# =========================
+                ocr_text = pytesseract.image_to_string(images[0])
 
-def extract_text(pdf_path):
-    doc = fitz.open(pdf_path)
-    text = ""
+                if ocr_text and len(ocr_text.split()) > MIN_WORDS_PER_PAGE:
+                    pages.append((i + 1, ocr_text.strip()))
 
-    for page in doc:
-        page_text = page.get_text()
-        
-        # fallback OCR if empty
-        if not page_text.strip():
-            pix = page.get_pixmap()
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            page_text = pytesseract.image_to_string(img)
+    return pages
 
-        text += page_text + "\n"
 
-    return text.lower()
+# ---------------------------
+# CHUNKING (PAGE LEVEL)
+# ---------------------------
+def extract_page_chunks(pdf_path):
+    page_texts = extract_text_with_fallback(pdf_path)
 
-# =========================
-# CHUNKING (structure-aware)
-# =========================
+    chunks = []
+    for page_num, text in page_texts:
+        chunks.append({
+            "text": text,
+            "page": page_num,
+            "source": os.path.basename(pdf_path)
+        })
 
-def split_sections(text):
-    return re.split(r'\n\s*\d+\.\s+', text)
+    return chunks
 
-# =========================
-# KEYWORD SCORING
-# =========================
 
-def keyword_score(text):
-    score = 0
-    
-    for kw in STRONG_KEYWORDS:
-        if kw in text:
-            score += 10
-            
-    for kw in MEDIUM_KEYWORDS:
-        if kw in text:
-            score += 5
-            
-    for kw in WEAK_KEYWORDS:
-        if kw in text:
-            score += 1
-            
-    return score
+# ---------------------------
+# LOAD FOLDER
+# ---------------------------
+def load_positive_chunks(folder_path):
+    all_chunks = []
 
-def phrase_score(text):
-    return sum(5 for p in PHRASES if re.search(p, text))
+    for file in os.listdir(folder_path):
+        if file.lower().endswith(".pdf"):
+            pdf_path = os.path.join(folder_path, file)
 
-# =========================
-# STRUCTURE DETECTION
-# =========================
+            print(f"Processing: {file}")
+            chunks = extract_page_chunks(pdf_path)
+            all_chunks.extend(chunks)
 
-def detect_title(text):
-    return "subscription agreement" in text[:1000]
+    print(f"\nTotal chunks: {len(all_chunks)}")
+    return all_chunks
 
-def has_signature_block(text):
-    return (
-        "signature" in text and
-        "date" in text and
-        "subscriber" in text
+
+# ---------------------------
+# BUILD VECTOR STORE
+# ---------------------------
+def build_vector_store(chunks, save_path=STORE_PATH):
+    texts = [c["text"] for c in chunks]
+
+    embeddings = model.encode(
+        texts,
+        batch_size=32,
+        normalize_embeddings=True,
+        show_progress_bar=True
     )
 
-def detect_sections(text):
-    sections = 0
-    
-    if "subscription" in text:
-        sections += 1
-    if "purchase price" in text or "payment" in text:
-        sections += 1
-    if "representations and warranties" in text:
-        sections += 1
-    if "signature" in text:
-        sections += 1
-        
-    return sections
-
-def structure_score(text):
-    return detect_sections(text) * 5
-
-# =========================
-# EMBEDDING SCORE
-# =========================
-
-def embedding_score(text_chunks):
-    scores = []
-    
-    for chunk in text_chunks:
-        emb = model.encode(chunk)
-        sim = cosine_similarity([emb], ref_embeddings).max()
-        scores.append(sim)
-    
-    if not scores:
-        return 0
-    
-    return max(scores) * 20  # scale
-
-# =========================
-# FINAL CLASSIFIER
-# =========================
-
-def classify_document(text):
-    
-    chunks = split_sections(text)
-    
-    k_score = sum(keyword_score(c) + phrase_score(c) for c in chunks)
-    s_score = structure_score(text)
-    e_score = embedding_score(chunks)
-    
-    score = (0.4 * k_score) + (0.4 * s_score) + (0.2 * e_score)
-    
-    # boosts
-    if detect_title(text):
-        score += 15
-    if has_signature_block(text):
-        score += 10
-    
-    label = "Subscription Agreement" if score >= 40 else "Other"
-    
-    return {
-        "label": label,
-        "score": round(score, 2),
-        "keyword_score": k_score,
-        "structure_score": s_score,
-        "embedding_score": round(e_score, 2)
+    store = {
+        "embeddings": embeddings.astype("float32"),
+        "metadata": chunks
     }
 
-# =========================
-# PROCESS FOLDER
-# =========================
+    with open(save_path, "wb") as f:
+        pickle.dump(store, f)
 
-def process_folder(folder):
+    print(f"\n✅ Stored {len(embeddings)} embeddings")
+
+
+# ---------------------------
+# LOAD STORE
+# ---------------------------
+def load_vector_store(path=STORE_PATH):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# ---------------------------
+# SCORE NEW PDF
+# ---------------------------
+def score_new_pdf(pdf_path, store):
+    chunks = extract_page_chunks(pdf_path)
     results = []
-    
-    for file in os.listdir(folder):
-        if file.endswith(".pdf"):
-            path = os.path.join(folder, file)
-            
-            print(f"\nProcessing: {file}")
-            
-            text = extract_text(path)
-            result = classify_document(text)
-            
-            result["file"] = file
-            results.append(result)
-            
-            print(result)
-    
+
+    for chunk in chunks:
+        v = model.encode([chunk["text"]], normalize_embeddings=True)[0]
+
+        sims = store["embeddings"] @ v
+        max_sim = float(np.max(sims))
+
+        results.append({
+            "page": chunk["page"],
+            "score": max_sim,
+            "preview": chunk["text"][:100]
+        })
+
     return results
 
-# =========================
-# RUN
-# =========================
 
+# ---------------------------
+# CLASSIFICATION
+# ---------------------------
+def classify_pdf(results, threshold=0.7, min_chunks=2):
+    strong = [r for r in results if r["score"] >= threshold]
+
+    if len(strong) >= min_chunks:
+        return "OF_INTEREST", strong
+    return "NOT_OF_INTEREST", strong
+
+
+# ---------------------------
+# MAIN
+# ---------------------------
 if __name__ == "__main__":
-    results = process_folder(PDF_FOLDER)
+    # Build store
+    chunks = load_positive_chunks("positive_pdfs/")
+    build_vector_store(chunks)
+
+    # Load store
+    store = load_vector_store()
+
+    # Test
+    results = score_new_pdf("test.pdf", store)
+
+    label, strong = classify_pdf(results)
+
+    print(f"\n📄 Classification: {label}")
+    for s in strong:
+        print(f"Page {s['page']} | Score {s['score']:.3f}")
